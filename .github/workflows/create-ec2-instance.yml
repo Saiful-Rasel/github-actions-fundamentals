@@ -1,3 +1,4 @@
+
 name: Create EC2 Instance (Ubuntu 24.04)
 
 on:
@@ -8,48 +9,49 @@ on:
         required: false
         default: "ostad-github-actions"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# REQUIRED GITHUB SECRETS
-#   AWS_ROLE_ARN          : ARN of the IAM role to assume via OIDC
-#                           (must have AmazonEC2FullAccess + iam:PassRole)
-#   EC2_KEY_PAIR_NAME     : Name of an existing EC2 Key Pair in ap-south-1
-#   EC2_INSTANCE_PROFILE  : Name of the IAM Instance Profile to attach
-#   EC2_VPC_ID            : VPC ID where the instance will be launched (vpc-xxxx)
-#   EC2_SUBNET_ID         : Subnet ID within the VPC (subnet-xxxx)
-# ─────────────────────────────────────────────────────────────────────────────
-
+# GitHub OIDC authentication permissions.
 permissions:
-  id-token: write   # required for OIDC token exchange
+  id-token: write
   contents: read
 
 jobs:
   create-instance:
-    name: Launch Ubuntu 24.04 t3.micro on ap-south-1
+    name: Launch Ubuntu 24.04 EC2
     runs-on: ubuntu-latest
 
     env:
       AWS_REGION: ap-south-1
       INSTANCE_TYPE: t3.micro
-      AMI_OWNER: "099720109477"           # Canonical (Ubuntu official)
+      AMI_OWNER: "099720109477"
       AMI_NAME_FILTER: "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
       SG_NAME: "github-actions-ec2-sg"
 
     steps:
-      # ── 1. Authenticate to AWS via OIDC ─────────────────────────────────────
-      - name: Configure AWS Credentials (OIDC)
+      # 1. Debug GitHub context (does not expose credentials).
+      - name: Debug GitHub Context
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Ref: $GITHUB_REF"
+          echo "Workflow: $GITHUB_WORKFLOW_REF"
+          echo "Event: $GITHUB_EVENT_NAME"
+
+      # 2. Authenticate with AWS using GitHub OIDC.
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
 
-      # ── 2. Fetch latest Ubuntu 24.04 AMI ID ─────────────────────────────────
+      # 3. Verify the assumed AWS identity.
+      - name: Verify AWS Identity
+        run: |
+          aws sts get-caller-identity
+
+      # 4. Find the latest official Ubuntu 24.04 AMI.
       - name: Resolve Latest Ubuntu 24.04 AMI
         id: ami
         run: |
-          echo "──────────────────────────────────────────────────────"
-          echo "  Resolving latest Ubuntu 24.04 AMI in ${AWS_REGION}"
-          echo "──────────────────────────────────────────────────────"
-
           AMI_ID=$(aws ec2 describe-images \
             --owners "$AMI_OWNER" \
             --filters \
@@ -62,108 +64,91 @@ jobs:
             --region "$AWS_REGION")
 
           if [[ -z "$AMI_ID" || "$AMI_ID" == "None" ]]; then
-            echo "ERROR: Could not resolve Ubuntu 24.04 AMI"
+            echo "ERROR: Ubuntu AMI not found"
             exit 1
           fi
 
-          echo "  AMI ID   : ${AMI_ID}"
-          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+          echo "Ubuntu AMI: $AMI_ID"
+          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
 
-      # ── 3. Create Security Group (idempotent) ────────────────────────────────
-      # If a SG with the same name already exists in the VPC, reuse its ID.
-      # If not, create a new one and open TCP/22 ingress.
+      # 5. Find or create the security group.
       - name: Create or Reuse Security Group
         id: sg
+        env:
+          VPC_ID: ${{ secrets.EC2_VPC_ID }}
         run: |
-          echo "──────────────────────────────────────────────────────"
-          echo "  Checking for existing Security Group: ${SG_NAME}"
-          echo "──────────────────────────────────────────────────────"
-
           EXISTING_SG=$(aws ec2 describe-security-groups \
             --filters \
-              "Name=group-name,Values=${SG_NAME}" \
-              "Name=vpc-id,Values=${{ secrets.EC2_VPC_ID }}" \
+              "Name=group-name,Values=$SG_NAME" \
+              "Name=vpc-id,Values=$VPC_ID" \
             --query "SecurityGroups[0].GroupId" \
             --output text \
             --region "$AWS_REGION")
 
           if [[ "$EXISTING_SG" != "None" && -n "$EXISTING_SG" ]]; then
-            echo "  Status   : Reusing existing SG ${EXISTING_SG}"
             SG_ID="$EXISTING_SG"
+            echo "Reusing Security Group: $SG_ID"
           else
-            echo "  Status   : Creating new Security Group ..."
             SG_ID=$(aws ec2 create-security-group \
               --group-name "$SG_NAME" \
-              --description "Managed by GitHub Actions - SSH access for EC2" \
-              --vpc-id "${{ secrets.EC2_VPC_ID }}" \
+              --description "GitHub Actions EC2 security group" \
+              --vpc-id "$VPC_ID" \
               --region "$AWS_REGION" \
               --query "GroupId" \
               --output text)
 
-            echo "  Created  : ${SG_ID}"
-            echo "  Opening TCP/22 ..."
-
-            aws ec2 authorize-security-group-ingress \
-              --group-id "$SG_ID" \
-              --protocol tcp \
-              --port 22 \
-              --cidr "0.0.0.0/0" \
-              --region "$AWS_REGION"
-
-            echo "  TCP/22   : Authorized"
+            echo "Created Security Group: $SG_ID"
           fi
 
-          echo "  SG ID    : ${SG_ID}"
-          echo "sg_id=${SG_ID}" >> "$GITHUB_OUTPUT"
+          # Do not expose SSH to the entire internet.
+          # Add a restricted TCP/22 rule separately if SSH is required.
+          echo "sg_id=$SG_ID" >> "$GITHUB_OUTPUT"
 
-      # ── 4. Launch EC2 Instance ──────────────────────────────────────────────
+      # 6. Launch the EC2 instance.
       - name: Launch EC2 Instance
         id: launch
+        env:
+          INSTANCE_NAME: ${{ inputs.instance_name }}
+          KEY_PAIR_NAME: ${{ secrets.EC2_KEY_PAIR_NAME }}
+          INSTANCE_PROFILE: ${{ secrets.EC2_INSTANCE_PROFILE }}
+          SUBNET_ID: ${{ secrets.EC2_SUBNET_ID }}
+          SECURITY_GROUP_ID: ${{ steps.sg.outputs.sg_id }}
+          AMI_ID: ${{ steps.ami.outputs.ami_id }}
         run: |
-          INSTANCE_NAME="${{ github.event.inputs.instance_name }}"
-          echo "──────────────────────────────────────────────────────"
-          echo "  Launching EC2 instance"
-          echo "  AMI           : ${{ steps.ami.outputs.ami_id }}"
-          echo "  Type          : ${INSTANCE_TYPE}"
-          echo "  Key Pair      : ${{ secrets.EC2_KEY_PAIR_NAME }}"
-          echo "  Instance Prof : ${{ secrets.EC2_INSTANCE_PROFILE }}"
-          echo "  Subnet        : ${{ secrets.EC2_SUBNET_ID }}"
-          echo "  Security Group: ${{ steps.sg.outputs.sg_id }}"
-          echo "  Name Tag      : ${INSTANCE_NAME}"
-          echo "──────────────────────────────────────────────────────"
-
           INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id "${{ steps.ami.outputs.ami_id }}" \
+            --image-id "$AMI_ID" \
             --instance-type "$INSTANCE_TYPE" \
-            --key-name "${{ secrets.EC2_KEY_PAIR_NAME }}" \
-            --iam-instance-profile "Name=${{ secrets.EC2_INSTANCE_PROFILE }}" \
-            --subnet-id "${{ secrets.EC2_SUBNET_ID }}" \
-            --security-group-ids "${{ steps.sg.outputs.sg_id }}" \
+            --key-name "$KEY_PAIR_NAME" \
+            --iam-instance-profile "Name=$INSTANCE_PROFILE" \
+            --subnet-id "$SUBNET_ID" \
+            --security-group-ids "$SECURITY_GROUP_ID" \
             --associate-public-ip-address \
             --tag-specifications \
-              "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}},{Key=CreatedBy,Value=github-actions},{Key=Workflow,Value=${{ github.workflow }}},{Key=RunNumber,Value=${{ github.run_number }}}]" \
+              "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME},{Key=CreatedBy,Value=github-actions},{Key=Workflow,Value=create-ec2},{Key=RunNumber,Value=${GITHUB_RUN_NUMBER}}]" \
             --region "$AWS_REGION" \
             --query "Instances[0].InstanceId" \
             --output text)
 
-          echo "  Instance ID  : ${INSTANCE_ID}"
-          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "Instance ID: $INSTANCE_ID"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
 
-      # ── 5. Wait for instance to reach running state ─────────────────────────
-      - name: Wait for Instance to be Running
+      # 7. Wait until the instance is running.
+      - name: Wait for Instance
+        env:
+          INSTANCE_ID: ${{ steps.launch.outputs.instance_id }}
         run: |
-          echo "Waiting for ${{ steps.launch.outputs.instance_id }} to reach state: running ..."
           aws ec2 wait instance-running \
-            --instance-ids "${{ steps.launch.outputs.instance_id }}" \
+            --instance-ids "$INSTANCE_ID" \
             --region "$AWS_REGION"
+
           echo "Instance is running."
 
-      # ── 6. Print deployment summary ─────────────────────────────────────────
-      - name: Print Deployment Summary
+      # 8. Print deployment information.
+      - name: Deployment Summary
+        env:
+          INSTANCE_ID: ${{ steps.launch.outputs.instance_id }}
         run: |
-          INSTANCE_ID="${{ steps.launch.outputs.instance_id }}"
-
-          INFO=$(aws ec2 describe-instances \
+          aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
             --region "$AWS_REGION" \
             --query "Reservations[0].Instances[0].{
@@ -172,37 +157,7 @@ jobs:
               PublicIP:PublicIpAddress,
               PrivateIP:PrivateIpAddress,
               AZ:Placement.AvailabilityZone,
-              Type:InstanceType,
-              AMI:ImageId,
-              KeyPair:KeyName,
+              InstanceType:InstanceType,
               Profile:IamInstanceProfile.Arn
             }" \
-            --output json)
-
-          PUBLIC_IP=$(echo "$INFO"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('PublicIP') or 'N/A')")
-          PRIVATE_IP=$(echo "$INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('PrivateIP') or 'N/A')")
-          AZ=$(echo "$INFO"         | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('AZ') or 'N/A')")
-          STATE=$(echo "$INFO"      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('State') or 'N/A')")
-          PROFILE=$(echo "$INFO"    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Profile') or 'N/A')")
-
-          echo ""
-          echo "══════════════════════════════════════════════════════"
-          echo "           EC2 INSTANCE DEPLOYMENT SUMMARY           "
-          echo "══════════════════════════════════════════════════════"
-          echo "  Instance ID       : ${INSTANCE_ID}"
-          echo "  State             : ${STATE}"
-          echo "  AMI               : ${{ steps.ami.outputs.ami_id }}  (Ubuntu 24.04)"
-          echo "  Instance Type     : ${INSTANCE_TYPE}"
-          echo "  Region / AZ       : ${AWS_REGION} / ${AZ}"
-          echo "  Public IP         : ${PUBLIC_IP}"
-          echo "  Private IP        : ${PRIVATE_IP}"
-          echo "  Key Pair          : ${{ secrets.EC2_KEY_PAIR_NAME }}"
-          echo "  Instance Profile  : ${PROFILE}"
-          echo "  Security Group    : ${{ steps.sg.outputs.sg_id }}"
-          echo "  Launched by       : ${{ github.actor }}"
-          echo "  Workflow run      : #${{ github.run_number }}"
-          echo "══════════════════════════════════════════════════════"
-          echo ""
-          echo "  SSH Command:"
-          echo "  ssh -i <your-key>.pem ubuntu@${PUBLIC_IP}"
-          echo ""
+            --output table
