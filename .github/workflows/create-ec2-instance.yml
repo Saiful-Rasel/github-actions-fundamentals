@@ -9,7 +9,7 @@ on:
         required: false
         default: "ostad-github-actions"
 
-# GitHub OIDC authentication permissions.
+# Required permissions for GitHub OIDC authentication.
 permissions:
   id-token: write
   contents: read
@@ -27,7 +27,8 @@ jobs:
       SG_NAME: "github-actions-ec2-sg"
 
     steps:
-      # 1. Debug GitHub context (does not expose credentials).
+
+      # 1. Debug GitHub workflow context.
       - name: Debug GitHub Context
         run: |
           echo "Repository: $GITHUB_REPOSITORY"
@@ -35,7 +36,60 @@ jobs:
           echo "Workflow: $GITHUB_WORKFLOW_REF"
           echo "Event: $GITHUB_EVENT_NAME"
 
-      # 2. Authenticate with AWS using GitHub OIDC.
+      # 2. Request GitHub OIDC token and inspect safe claims.
+      - name: Debug OIDC Token Claims
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node <<'NODE'
+          (async () => {
+            const tokenUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+            const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+
+            if (!tokenUrl || !requestToken) {
+              throw new Error("GitHub OIDC environment variables are missing");
+            }
+
+            const url = new URL(tokenUrl);
+            url.searchParams.set("audience", "sts.amazonaws.com");
+
+            const response = await fetch(url, {
+              headers: {
+                Authorization: `Bearer ${requestToken}`
+              }
+            });
+
+            if (!response.ok) {
+              throw new Error(`OIDC request failed: HTTP ${response.status}`);
+            }
+
+            const result = await response.json();
+
+            if (!result.value) {
+              throw new Error("OIDC token was not returned");
+            }
+
+            // Decode JWT payload only. Never print the actual token.
+            const payload = result.value.split(".")[1];
+
+            const claims = JSON.parse(
+              Buffer.from(payload, "base64url").toString("utf8")
+            );
+
+            console.log("GitHub OIDC Claims:");
+            console.log(JSON.stringify({
+              iss: claims.iss,
+              aud: claims.aud,
+              sub: claims.sub
+            }, null, 2));
+          })().catch(error => {
+            console.error(error.message);
+            process.exit(1);
+          });
+          NODE
+
+      # 3. Authenticate with AWS using OIDC.
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -43,15 +97,19 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           audience: sts.amazonaws.com
 
-      # 3. Verify the assumed AWS identity.
+      # 4. Verify AWS identity.
       - name: Verify AWS Identity
         run: |
           aws sts get-caller-identity
 
-      # 4. Find the latest official Ubuntu 24.04 AMI.
+      # 5. Resolve latest Ubuntu 24.04 AMI.
       - name: Resolve Latest Ubuntu 24.04 AMI
         id: ami
         run: |
+          set -euo pipefail
+
+          echo "Finding Ubuntu 24.04 AMI..."
+
           AMI_ID=$(aws ec2 describe-images \
             --owners "$AMI_OWNER" \
             --filters \
@@ -71,12 +129,14 @@ jobs:
           echo "Ubuntu AMI: $AMI_ID"
           echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
 
-      # 5. Find or create the security group.
+      # 6. Find or create Security Group.
       - name: Create or Reuse Security Group
         id: sg
         env:
           VPC_ID: ${{ secrets.EC2_VPC_ID }}
         run: |
+          set -euo pipefail
+
           EXISTING_SG=$(aws ec2 describe-security-groups \
             --filters \
               "Name=group-name,Values=$SG_NAME" \
@@ -91,7 +151,7 @@ jobs:
           else
             SG_ID=$(aws ec2 create-security-group \
               --group-name "$SG_NAME" \
-              --description "GitHub Actions EC2 security group" \
+              --description "GitHub Actions managed EC2 security group" \
               --vpc-id "$VPC_ID" \
               --region "$AWS_REGION" \
               --query "GroupId" \
@@ -100,11 +160,10 @@ jobs:
             echo "Created Security Group: $SG_ID"
           fi
 
-          # Do not expose SSH to the entire internet.
-          # Add a restricted TCP/22 rule separately if SSH is required.
+          # SSH is intentionally not exposed to the public internet.
           echo "sg_id=$SG_ID" >> "$GITHUB_OUTPUT"
 
-      # 6. Launch the EC2 instance.
+      # 7. Launch EC2 instance.
       - name: Launch EC2 Instance
         id: launch
         env:
@@ -115,6 +174,8 @@ jobs:
           SECURITY_GROUP_ID: ${{ steps.sg.outputs.sg_id }}
           AMI_ID: ${{ steps.ami.outputs.ami_id }}
         run: |
+          set -euo pipefail
+
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "$AMI_ID" \
             --instance-type "$INSTANCE_TYPE" \
@@ -132,22 +193,26 @@ jobs:
           echo "Instance ID: $INSTANCE_ID"
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
 
-      # 7. Wait until the instance is running.
+      # 8. Wait until EC2 is running.
       - name: Wait for Instance
         env:
           INSTANCE_ID: ${{ steps.launch.outputs.instance_id }}
         run: |
+          set -euo pipefail
+
           aws ec2 wait instance-running \
             --instance-ids "$INSTANCE_ID" \
             --region "$AWS_REGION"
 
           echo "Instance is running."
 
-      # 8. Print deployment information.
+      # 9. Print deployment summary.
       - name: Deployment Summary
         env:
           INSTANCE_ID: ${{ steps.launch.outputs.instance_id }}
         run: |
+          set -euo pipefail
+
           aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
             --region "$AWS_REGION" \
